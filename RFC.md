@@ -2,7 +2,7 @@
 
 |  |  |
 | --- | --- |
-| **Time** | Equipe Bootcamp |
+| **Time** | Carlos Vitor |
 | **Data** | 12/10/2026 |
 | **Versão** | 8 |
 
