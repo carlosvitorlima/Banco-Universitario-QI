@@ -169,3 +169,8 @@ class UniversityApiTimeoutError(QIException):
     code = "QIT001504"
     def __init__(self):
         super().__init__("University API Timeout", self.code, 504, "University API timed out.", "Tempo de resposta esgotado na consulta acadêmica.")
+        
+class SplitAlreadyExistsError(QIException):
+    code = "QIT001413"
+    def __init__(self):
+        super().__init__("Split Already Exists", self.code, 409, "A split for this account and transaction already exists.", "Esta divisão de conta já foi registrada anteriormente.")

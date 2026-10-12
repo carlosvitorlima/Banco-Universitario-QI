@@ -11,13 +11,16 @@ class BenefitRepository:
     def find_by_key(self, benefit_key: str) -> Benefit:
         return self.session.query(Benefit).filter_by(benefit_key=benefit_key).first()
 
-    def find_all(self) -> list[tuple[Benefit, Partner]]:
-        return (
+    def find_all_paginated(self, limit: int, cursor_id: int = None) -> list[tuple[Benefit, Partner]]:
+        query = (
             self.session.query(Benefit, Partner)
             .join(Partner, Benefit.partner_id == Partner.id)
-            .order_by(Benefit.id.asc())
-            .all()
         )
+        
+        if cursor_id:
+            query = query.filter(Benefit.id > cursor_id)
+            
+        return query.order_by(Benefit.id.asc()).limit(limit + 1).all()
 
     def create_redemption(self, benefit_id: int, customer_id: int) -> BenefitRedemption:
         try:

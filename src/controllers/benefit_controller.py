@@ -15,9 +15,19 @@ class BenefitController(BaseController):
         self.benefit_repo = BenefitRepository(self.context)
         self.customer_repo = CustomerRepository(self.context)
 
-    def list_benefits(self) -> BenefitListDTO:
-        return BenefitListDTO.from_models(self.benefit_repo.find_all())
-
+    def list_benefits(self, limit: int, cursor: int = None) -> BenefitListDTO:
+        results = self.benefit_repo.find_all_paginated(limit, cursor)
+        
+        has_next = len(results) > limit
+        benefits_to_return = results[:limit]
+        
+        next_cursor = benefits_to_return[-1][0].id if has_next else None
+        
+        return BenefitListDTO.from_models(
+            benefits=benefits_to_return,
+            next_cursor=next_cursor
+        )
+        
     def redeem_benefit(self, benefit_key: str, payload: dict) -> BenefitRedemptionDTO:
         customer_key = payload["customer_key"]
 

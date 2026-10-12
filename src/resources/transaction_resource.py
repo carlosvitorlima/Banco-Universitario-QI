@@ -38,9 +38,9 @@ class TransactionResource:
         )
 
     @SchemaHandler.validate("create_split.json")
-    def on_post_split(self, transaction_key: str, payload: dict) -> JSONResponse:
+    def on_post_split(self, transaction_key: UUID, payload: dict) -> JSONResponse:
         controller = SplitBillController(class_name=__name__)
-        result = controller.create_split(transaction_key, payload)
+        result = controller.create_split(str(transaction_key), payload)
         
         return JSONResponse(
             content=jsonable_encoder(result),

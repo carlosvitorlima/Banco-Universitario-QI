@@ -12,8 +12,11 @@ services:
       INTERNAL_TOKEN: ${INTERNAL_TOKEN:-default_token}
       UNIVERSITY_API_URL: ${UNIVERSITY_API_URL:-http://localhost:8081}
       UNIVERSITY_API_TOKEN: ${UNIVERSITY_API_TOKEN:-default_token}
+      PYTHONPATH: /app
+      PYTEST_ADDOPTS: --import-mode=importlib
     volumes:
       - ./src:/app
+      - ./tests:/app/tests
     command: uvicorn app:app --host 0.0.0.0 --port 3000 --no-server-header --reload
     healthcheck:
       test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:3000/health_check\")'"]

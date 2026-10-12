@@ -1,5 +1,7 @@
+from sqlalchemy.exc import IntegrityError
 from database import Context
 from models.split_bill import SplitBill
+from errors.custom_errors import SplitAlreadyExistsError
 
 class SplitBillRepository:
     def __init__(self, context: Context):
@@ -15,5 +17,8 @@ class SplitBillRepository:
             for split in splits
         ]
         
-        self.session.add_all(split_records)
-        self.session.flush()
+        try:
+            self.session.add_all(split_records)
+            self.session.flush()
+        except IntegrityError:
+            raise SplitAlreadyExistsError()

@@ -46,13 +46,26 @@ def test_benefit_list_returns_partner_and_eligibility_targets(client):
         benefit_title = benefit.title
         session.commit()
 
-    response = client.get("/benefits")
+    response = client.get("/benefits", params={"limit": 10})
+    listed_benefit = None
+    while True:
+        assert response.status_code == 200
+        page = response.json()
+        listed_benefit = next(
+            (
+                item for item in page["data"]
+                if item["benefit_key"] == benefit_key
+            ),
+            None,
+        )
+        if listed_benefit is not None or page["next_cursor"] is None:
+            break
+        response = client.get(
+            "/benefits",
+            params={"limit": 10, "cursor": page["next_cursor"]},
+        )
 
-    assert response.status_code == 200
-    listed_benefit = next(
-        item for item in response.json()["data"]
-        if item["benefit_key"] == benefit_key
-    )
+    assert listed_benefit is not None
     assert listed_benefit == {
         "benefit_key": benefit_key,
         "title": benefit_title,

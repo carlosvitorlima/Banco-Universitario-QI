@@ -62,14 +62,17 @@ class BenefitDTO:
 @dataclass(frozen=True)
 class BenefitListDTO:
     data: list[BenefitDTO]
+    next_cursor: int | None
 
     @classmethod
     def from_models(
         cls,
         benefits: list[tuple[Benefit, Partner]],
+        next_cursor: int | None
     ) -> "BenefitListDTO":
         return cls(
-            data=[BenefitDTO.from_models(benefit, partner) for benefit, partner in benefits]
+            data=[BenefitDTO.from_models(benefit, partner) for benefit, partner in benefits],
+            next_cursor=next_cursor
         )
 
 

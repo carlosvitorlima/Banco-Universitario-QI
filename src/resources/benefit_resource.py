@@ -1,13 +1,20 @@
-from fastapi import status
+from uuid import UUID
+
+from fastapi import Request, status
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 from controllers.benefit_controller import BenefitController
 from utils.schema_handler import SchemaHandler
 
 class BenefitResource:
-    def on_get_list(self) -> JSONResponse:
+    @SchemaHandler.validate_query_params("get_benefits.json")
+    def on_get_list(self, request: Request) -> JSONResponse:
+        limit = int(request.query_params.get("limit", 10))
+        cursor_str = request.query_params.get("cursor")
+        cursor = int(cursor_str) if cursor_str else None
+
         controller = BenefitController(class_name=__name__)
-        result = controller.list_benefits()
+        result = controller.list_benefits(limit, cursor)
 
         return JSONResponse(
             content=jsonable_encoder(result),
@@ -15,11 +22,11 @@ class BenefitResource:
         )
 
     @SchemaHandler.validate("redeem_benefit.json")
-    def on_post_redeem(self, key: str, payload: dict) -> JSONResponse:
+    def on_post_redeem(self, key: UUID, payload: dict) -> JSONResponse:
         controller = BenefitController(class_name=__name__)
         
         result = controller.redeem_benefit(
-            benefit_key=key, 
+            benefit_key=str(key),
             payload=payload
         )
         
