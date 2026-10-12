@@ -8,7 +8,6 @@ CREATE TABLE course (
     name VARCHAR(150) NOT NULL
 );
 
--- Cadastros básicos para os testes passarem sem erro de Foreign Key
 INSERT INTO university (id, name) VALUES (1, 'Universidade QI');
 INSERT INTO course (id, name) VALUES (1, 'Engenharia de Software');
 
@@ -21,8 +20,6 @@ CREATE TABLE customer (
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
-
--- 2. Contas Bancárias
 CREATE TABLE account_status (
     id SERIAL PRIMARY KEY,
     name VARCHAR(50) NOT NULL
@@ -33,7 +30,6 @@ CREATE TABLE account_type (
     name VARCHAR(50) NOT NULL
 );
 
--- Status esperados pelos seus controllers
 INSERT INTO account_status (name) VALUES ('ACTIVE'), ('BLOCKED'), ('CLOSED');
 INSERT INTO account_type (name) VALUES ('CHECKING'), ('SAVINGS');
 
@@ -56,8 +52,6 @@ CREATE TABLE account_status_event (
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
-
--- 3. Benefícios
 CREATE TABLE partner (
     id SERIAL PRIMARY KEY,
     name VARCHAR(100) NOT NULL
@@ -81,8 +75,6 @@ CREATE TABLE benefit_redemption (
     CONSTRAINT unique_customer_benefit_redemption UNIQUE(benefit_id, customer_id)
 );
 
-
--- 4. Seguros
 CREATE TABLE insurance (
     id SERIAL PRIMARY KEY,
     name VARCHAR(100) NOT NULL,
@@ -98,8 +90,6 @@ CREATE TABLE contracted_insurance (
     CONSTRAINT unique_customer_insurance UNIQUE(insurance_id, customer_id)
 );
 
-
--- 5. Transações e Splits (Divisão de Contas)
 CREATE TABLE transaction (
     id SERIAL PRIMARY KEY,
     transaction_key UUID UNIQUE NOT NULL,
