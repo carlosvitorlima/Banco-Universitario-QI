@@ -1,684 +1,583 @@
-# Bootcamp QI Tech — projeto base da API
+# RFC — Banco Universitário
+
+|  |  |
+| --- | --- |
+| **Time** | Equipe Bootcamp |
+| **Data** | 12/10/2026 |
+| **Versão** | 8 |
+
+## Contextualização
+
+### Entendendo o problema
+
+O projeto consiste em um banco digital para estudantes universitários. O sistema oferece operações de gestão de contas correntes e poupança, transferências, divisão de despesas, resgate de benefícios e contratação de seguros. O modelo permite múltiplas contas por cliente; não há uma operação específica de subconta.
+
+É necessário garantir a segurança do dinheiro sob concorrência. A solução deve ser capaz de lidar com requisições simultâneas, retentativas de rede, possíveis transações duplicadas ou divergência de valores no extrato. Fica fora do escopo desta entrega integrações com open finance, operações de crédito e investimentos.
+
+### Explicando a solução de forma macro
+
+A solução utiliza uma arquitetura limpa em camadas:
+
+* **Validação de Entrada:** Os dados entram protegidos por schemas, rejeitando valores inválidos na camada de *Resources*.
+* **Segurança Transacional:** A lógica do negócio reside nos *Controllers*, que gerenciam sessões unificadas via contexto de requisição.
+* **Como garantir integridade:** Transferências exigem uma `idempotency_key` com restrição `UNIQUE` mapeada diretamente no banco de dados. Tentativas de duplicidade disparam `IntegrityError` tratadas como conflito (`409`).
+* **Como controlar a concorrência:** Transferências bloqueiam as contas envolvidas com `FOR UPDATE`, ordenadas pelo ID da conta. Essa ordem reduz o risco de *deadlock* entre transferências que seguem o mesmo fluxo; não é uma garantia geral contra *deadlocks* em qualquer operação futura.
+* `Soft delete` — não implementada: a API atual não oferece exclusão de clientes, contas ou transações. A exclusão física pode comprometer referências e auditoria; *soft delete*, por si só, preserva os registros.
+* `N Tabelas para N tipos de contas` — descartada porque multiplicaria a complexidade das consultas de extrato e aumentaria a chance de *deadlocks*. O modelo com tabela de tipos (`account_type`) permite esta flexibilidade.
+* `Paginação via Offset no extrato` — o método de controller existente usa cursor pelo ID crescente da transação. O cursor permite continuar a consulta após o último ID retornado; não representa um snapshot imutável diante de novas inserções.
+
+## Implementação
+
+### Rotas e Contratos
+
+> **Nota:**
+> As rotas `GET /` e `GET /health_check` são públicas. As demais rotas registradas exigem `INTERNAL-TOKEN`; sem ele ou com valor incorreto, a resposta é `403 Forbidden`.
+> Erros de domínio usam o envelope `{title, description, translation, code}`.
+
+| Método | Caminho | O que faz | Entrada | Saídas |
+| --- | --- | --- | --- | --- |
+| `GET` | `/` | Identifica o serviço. | Aberta, sem token. | `200` com `service` e `id` do processo. |
+| `GET` | `/health_check` | Verifica a saúde do serviço. | Aberta, sem token. | `204 No Content`. |
+| `POST` | `/customers` | Cadastra o estudante após validar o formato e a matemática do CPF e consultar o vínculo acadêmico. | `INTERNAL-TOKEN`, `document` (11 dígitos), `university_id`, `course_id` | `201` com `customer_key`; `400 QIT000001` schema inválido; `403 QIT000002` token ausente/inválido; `409 QIT001410` CPF duplicado; `422 QIT001424` CPF inválido ou `QIT001425` vínculo inválido; `502 QIT001502` falha na API universitária; `504 QIT001504` timeout. |
+| `POST` | `/accounts` | Abre uma conta corrente ou poupança para um cliente. | `INTERNAL-TOKEN`, `customer_key` (UUID), `type_id` (inteiro >= 1) | `201` com `account_key`; `400 QIT000001` payload inválido; `403 QIT000002` token inválido; `404 QIT001101` cliente inexistente; `500 QIT001500` status inicial não configurado. |
+| `POST` | `/transactions` | Realiza uma transferência financeira em centavos. | `INTERNAL-TOKEN`, `idempotency_key` (mínimo 5 caracteres), `origin_account_key`, `destination_account_key` (UUIDs), `amount` (inteiro >= 1) | `201` com `transaction_key`; `400 QIT000001` schema inválido ou `QIT001429` origem e destino iguais; `403 QIT000002` token inválido; `404 QIT001102` conta de origem ou destino inexistente; `409 QIT001412` chave de idempotência duplicada; `422 QIT001427` saldo insuficiente. |
+| `GET` | `/accounts/{account_key}/transactions` | Consulta débitos e créditos de uma conta, paginados por cursor. | `INTERNAL-TOKEN`, `account_key` (UUID), `limit` (opcional, padrão 10, de 1 a 100), `cursor` (opcional, ID positivo da última transação) | `200` com `data` e `next_cursor`; `400 QIT000010` UUID ou parâmetro inválido; `403 QIT000002` token inválido; `404 QIT001102` conta inexistente. |
+| `GET` | `/benefits` | Lista o catálogo de benefícios e parceiros com seus alvos de elegibilidade. | `INTERNAL-TOKEN` | `200` com `data` (lista, vazia quando não há benefícios); `403 QIT000002` token inválido. |
+| `POST` | `/benefits/{key}/redemptions` | Resgata um benefício sujeito à elegibilidade de curso e universidade. | `INTERNAL-TOKEN`, `customer_key` (UUID) | `201` com `voucher_code`; `400 QIT000001` payload inválido; `403 QIT000002` token inválido; `404 QIT001101` cliente ou `QIT001103` benefício inexistente; `409 QIT001409` benefício já resgatado; `422 QIT001422` universidade ou `QIT001423` curso inelegível. |
+| `POST` | `/insurances` | Contrata um seguro para o cliente. | `INTERNAL-TOKEN`, `customer_key` (UUID), `insurance_id` (inteiro >= 1) | `201` com `policy_number` (UUID); `400 QIT000001` payload inválido; `403 QIT000002` token inválido; `404 QIT001101` cliente ou `QIT001104` seguro inexistente; `409 QIT001411` seguro já contratado. |
+| `POST` | `/transactions/{transaction_key}/splits` | Registra a divisão do valor de uma transação entre contas pagadoras. | `INTERNAL-TOKEN`, `splits` (array não vazio de objetos `{account_key, amount}`; UUID e inteiro >= 1) | `201` divisão registrada; `400 QIT000001` schema inválido ou `QIT001400` conta pagadora duplicada; `403 QIT000002` token inválido; `404 QIT001105` transação inexistente; `422 QIT001428` soma diferente do total ou `QIT001426` conta pagadora inexistente. |
+
+### Banco de Dados (Diagrama ER)
+
+## Principal desafio arquitetural
+> * **Qual é:** Preservar a consistência dos saldos e a rastreabilidade das operações financeiras sob concorrência.
+> * **Por que é difícil:** Retentativas de rede ou execuções simultâneas podem gerarobreposição e negativando a conta de forma indevida.
+> * **Como o desenho implementado ajuda:** A tabela `account` possui `CHECK (balance >= 0)`, `transaction.idempotency_key` é `UNIQUE`, e a transferência bloqueia as contas com `FOR UPDATE` em ordem crescente de ID. A regra de saldo no controller compara o saldo de origem com o valor da transferência. Essas medidas protegem o saldo e evitam repetição da chave; não há constraint ou trigger que impeça alterações/exclusões diretas no histórico de transações.
+
+### Diagrama
+
+```mermaid
+erDiagram
+    UNIVERSITY ||--o{ CUSTOMER : "estuda em"
+    COURSE ||--o{ CUSTOMER : "cursa"
+    UNIVERSITY ||--o{ BENEFIT : "restringe a"
+    COURSE ||--o{ BENEFIT : "restringe a"
+    
+    ACCOUNT_TYPE ||--o{ ACCOUNT : "define"
+    ACCOUNT_STATUS ||--o{ ACCOUNT : "esta em"
+    
+    CUSTOMER ||--o{ ACCOUNT : "possui"
+    CUSTOMER ||--o{ BENEFIT_REDEMPTION : "resgata"
+    CUSTOMER ||--o{ CONTRACTED_INSURANCE : "contrata"
+    
+    ACCOUNT ||--o{ TRANSACTION : "origina"
+    ACCOUNT ||--o{ TRANSACTION : "recebe"
+    ACCOUNT ||--o{ ACCOUNT_STATUS_EVENT : "sofre"
+    ACCOUNT_STATUS ||--o{ ACCOUNT_STATUS_EVENT : "registra"
+    
+    TRANSACTION ||--o{ SPLIT_BILL : "dividida em"
+    ACCOUNT ||--o{ SPLIT_BILL : "paga por"
+    
+    PARTNER ||--o{ BENEFIT : "oferece"
+    BENEFIT ||--o{ BENEFIT_REDEMPTION : "e resgatado em"
+    INSURANCE ||--o{ CONTRACTED_INSURANCE : "possui contrato"
+
+    UNIVERSITY {
+        serial id PK
+        varchar name "Ex: USP, UNICAMP"
+    }
+
+    COURSE {
+        serial id PK
+        varchar name "Ex: Engenharia, Direito"
+    }
+
+    CUSTOMER {
+        serial id PK "interno"
+        uuid customer_key UK "externo"
+        varchar document UK "CPF (11 digitos)"
+        int university_id FK 
+        int course_id FK 
+        timestamp created_at
+    }
+
+    INSURANCE {
+        serial id PK
+        varchar name "Nome do seguro"
+        int monthly_premium "Valor em centavos"
+    }
+
+    CONTRACTED_INSURANCE {
+        serial id PK
+        uuid policy_number UK "Apólice"
+        int insurance_id FK
+        int customer_id FK
+        timestamp created_at
+    }
+
+    ACCOUNT_TYPE {
+        serial id PK
+        varchar name "CHECKING, SAVINGS"
+    }
+
+    ACCOUNT_STATUS {
+        serial id PK
+        varchar name "ACTIVE, BLOCKED, CLOSED"
+    }
+
+    ACCOUNT {
+        serial id PK
+        uuid account_key UK 
+        int customer_id FK 
+        int status_id FK 
+        int type_id FK 
+        bigint balance "estado em centavos (CHECK >= 0)"
+        timestamp created_at
+    }
+
+    ACCOUNT_STATUS_EVENT {
+        serial id PK
+        int account_id FK 
+        int from_status_id FK "nulo na criação"
+        int to_status_id FK
+        timestamp created_at 
+    }
+
+    TRANSACTION {
+        serial id PK
+        uuid transaction_key UK 
+        varchar idempotency_key UK 
+        int origin_account_id FK 
+        int destination_account_id FK 
+        bigint amount "em centavos"
+        timestamp created_at
+    }
+
+    SPLIT_BILL {
+        serial id PK 
+        int transaction_id FK 
+        int payer_account_id FK 
+        bigint amount 
+        varchar status 
+    }
+
+    PARTNER {
+        serial id PK
+        varchar name 
+    }
+
+    BENEFIT {
+        serial id PK
+        uuid benefit_key UK 
+        int partner_id FK 
+        int target_university_id FK "nulo = todas"
+        int target_course_id FK "nulo = todos"
+        varchar title 
+    }
+
+    BENEFIT_REDEMPTION {
+        serial id PK
+        int customer_id FK 
+        int benefit_id FK 
+        varchar voucher_code
+        timestamp created_at 
+    }
 
-Projeto base do Bootcamp: uma API REST em **Python + FastAPI**, com banco
-**PostgreSQL**, rodando em **Docker**.
-
-Você não precisa saber programar para começar. A API e o banco sobem
-no **Docker**, então você não instala nem um nem outro na sua máquina.
-Os **testes** rodam no seu Python — são dois comandos, e a seção 2
-mostra os dois.
-
----
-
-## 0. O que você precisa ter instalado
-
-São três coisas.
-
-| O quê | Para quê | Como conferir |
-|---|---|---|
-| **Docker** (com o Docker Desktop no Mac/Windows) | roda a API e o banco | `docker compose version` |
-| **Git** | trazer o projeto para o seu computador | `git --version` |
-| **Python 3.11 ou mais novo** | rodar os testes (seção 2) | `python3 --version` |
-
-Abra o terminal e rode os três comandos da coluna da direita. Se todos
-responderem um número de versão, você está pronto.
-
-> **Por que o Python, se tudo roda no Docker?** Porque os testes rodam
-> FORA dele, na sua máquina, contra a API que está de pé no container.
-> O ganho é o ciclo: você salva um teste e roda na hora, sem esperar
-> imagem nenhuma ser montada. O preço está explicado na seção 2.
-
-> **`docker compose version` deu erro?** Sua instalação do Docker é
-> antiga demais (ou o Docker não está ligado). No Mac e no Windows,
-> abra o **Docker Desktop** e espere a baleia parar de se mexer. Se o
-> comando continuar falhando, reinstale pelo site oficial —
-> o `docker compose` (com **espaço**) vem junto desde 2022.
-
-Nada além destes três. Se em algum momento este projeto pedir que você
-instale outro PROGRAMA, é um bug do projeto — avise a gente. (As
-bibliotecas Python que os testes usam são outra conversa: elas entram
-com um `pip install` na seção 2, dentro de uma pasta do próprio
-projeto, e somem quando você apaga essa pasta.)
-
----
-
-## 1. Rodando pela primeira vez
-
-```bash
-docker compose up
-```
-
-Um comando. Só isso, e não precisa criar nem copiar arquivo nenhum
-antes: as configurações já vêm com valor padrão dentro do
-`docker-compose.yml`.
-
-O Docker baixa o Python, sobe o banco, cria as tabelas e liga a API. Na
-primeira vez demora alguns minutos; depois é quase instantâneo.
-
-São duas coisas de pé, e vale saber o nome de cada uma:
-
-| Serviço | O que é |
-|---|---|
-| `api` | a API que responde às suas requisições |
-| `db` | o banco de dados (PostgreSQL) |
-
-Quando aparecer `Application startup complete`, a API está no ar. Abra
-no navegador:
-
-### 👉 http://localhost:3000
-
-Você vai ver isto:
-
-```json
-{"service":"bootcamp-api","id":"8"}
-```
-
-Pouca coisa, e de propósito: essa rota só diz "estou viva, e eu sou este
-serviço". Mas você acabou de fazer uma **requisição HTTP** — a mesma
-coisa que o navegador faz ao abrir qualquer site.
-
-### Agora as outras rotas
-
-Elas não abrem no navegador, porque exigem um cabeçalho: o
-`INTERNAL-TOKEN`, que é a senha da API (seção 6). Para mandar um
-cabeçalho a gente usa o `curl`, um programa de linha de comando que já
-vem instalado no Mac, no Linux e no Windows.
-
-**Abra um segundo terminal** — o primeiro está ocupado rodando a API — e
-cole um comando de cada vez.
-
-> **No Windows**, use o **Git Bash**: ele veio junto com o Git da seção
-> 0. No PowerShell estes comandos não funcionam, porque lá `curl` é o
-> apelido de outro programa, com outra sintaxe.
-
-#### 1. Criar uma entidade
-
-```bash
-curl -X POST http://localhost:3000/sample_entity \
-  -H "INTERNAL-TOKEN: default_token" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "hello": "world",
-    "name": "Maria da Silva",
-    "email": "maria.silva@exemplo.com.br",
-    "document_number": "529.982.247-25",
-    "birthdate": "1990-05-17"
-  }'
-```
-
-```json
-{"sample_entity_key":"3fbf83e9-e5fc-4e0f-8427-db6a1a50f964"}
-```
-
-Esse `sample_entity_key` é o endereço da entidade que você acabou de
-criar. **Copie o seu** — ele nasce diferente a cada vez, e nos comandos
-abaixo você troca o que está escrito aqui pelo seu.
-
-> **Rodou o comando duas vezes e levou 409 na segunda?** É de propósito:
-> o CPF e o e-mail não podem se repetir. Para criar uma segunda
-> entidade, troque o e-mail (qualquer um serve) e o CPF — mas o CPF tem
-> que ser **válido de verdade**, com os dois dígitos finais batendo com
-> a conta. O `529.982.247-25` acima é um CPF de teste conhecido, que
-> passa na conta e não pertence a ninguém.
->
-> **E os cinco campos são todos obrigatórios?** São. Mande `{}` e a API
-> diz qual está faltando — é o comando 6 lá embaixo.
-
-#### 2. Buscar a entidade
-
-```bash
-curl http://localhost:3000/sample_entity/3fbf83e9-e5fc-4e0f-8427-db6a1a50f964 \
-  -H "INTERNAL-TOKEN: default_token"
-```
-
-```json
-{"hello":"world","sample_entity_key":"3fbf83e9-e5fc-4e0f-8427-db6a1a50f964","name":"Maria da Silva","email":"maria.silva@exemplo.com.br","document_number":"529.982.247-25","birthdate":"1990-05-17","status":"pending","counter":0,"status_events":[{"status":"pending","event_datetime":"2026-09-11T20:36:43.104210"}]}
-```
-
-Você mandou cinco campos e voltaram nove. Os quatro extras a API montou
-sozinha:
-
-- **`sample_entity_key`** — o endereço da entidade;
-- **`status`** — o estado inicial, `pending`;
-- **`counter`** — um contador zerado;
-- **`status_events`** — a **história**. Cada vez que o status muda, uma
-  linha nova entra aqui, com a hora. Saber onde a entidade está é uma
-  coisa; saber por onde ela passou é outra, e é essa lista que responde
-  a segunda.
-
-#### 3. Listar as entidades
-
-```bash
-curl http://localhost:3000/sample_entities \
-  -H "INTERNAL-TOKEN: default_token"
-```
-
-```json
-{"data":[{"hello":"world","sample_entity_key":"3fbf83e9-e5fc-4e0f-8427-db6a1a50f964","name":"Maria da Silva","email":"maria.silva@exemplo.com.br","document_number":"529.982.247-25","birthdate":"1990-05-17","status":"pending","counter":0}],"limit":10,"page":0,"is_last_page":true}
-```
-
-Vêm de dez em dez, da mais nova para a mais antiga. Para pedir outra
-quantidade ou outra página, acrescente `?limit=2&page=0` ao endereço —
-o `limit` vai até **100**. O `is_last_page` já responde a pergunta
-seguinte — "tem mais?" — sem custar uma segunda requisição.
-
-Repare no que **não** veio: o `status_events`. Na lista cada item vem
-resumido, porque montar a história de cada entidade custa uma consulta a
-mais por item — numa página de 100, são 100 consultas para uma
-informação que quem está varrendo não pediu. A história aparece quando
-você abre UMA entidade, no comando 2.
-
-Também dá para **filtrar**. Todos os filtros se combinam, e todos são
-opcionais:
-
-```bash
-curl "http://localhost:3000/sample_entities?name=maria&status=pending&status=failed" \
-  -H "INTERNAL-TOKEN: default_token"
-```
-
-| Filtro | Como casa |
-|---|---|
-| `name` | por **pedaço**, ignorando maiúscula/minúscula |
-| `email` | exato |
-| `document_number` | exato |
-| `birthdate_from` / `birthdate_to` | intervalo, **incluindo** as duas pontas |
-| `status` | pode repetir: `?status=pending&status=failed` traz os dois |
-
-Repare que `status` se comporta ao contrário dos outros: `name` junto
-com `email` **estreita** a busca (os dois precisam bater), mas dois
-`status` **alargam** (basta um bater). Faz sentido pelo que a pessoa
-quer dizer — "me mostra o que deu errado e o que deu certo" é um pedido
-legítimo, e uma entidade só pode estar num dos baldes.
-
-#### 4. Somar 1 no contador
-
-```bash
-curl -i -X PUT http://localhost:3000/webhook/sample_entity/3fbf83e9-e5fc-4e0f-8427-db6a1a50f964/increment_counter \
-  -H "INTERNAL-TOKEN: default_token"
-```
-
-```
-HTTP/1.1 204 No Content
-```
-
-Esta rota não responde nada — por isso o `-i`, que manda o `curl`
-mostrar também o **status** da resposta. `204` quer dizer "deu certo e
-não tenho nada a dizer". Repita o comando 2: o `counter` agora é `1`.
-
-#### 5. Mudar o status
-
-```bash
-curl -X PUT http://localhost:3000/sample_entity/3fbf83e9-e5fc-4e0f-8427-db6a1a50f964 \
-  -H "INTERNAL-TOKEN: default_token" \
-  -H "Content-Type: application/json" \
-  -d '{"status": "success"}'
-```
-
-```json
-{"sample_entity_key":"3fbf83e9-e5fc-4e0f-8427-db6a1a50f964"}
-```
-
-Repita o comando 2: o `status` virou `success`. E rode este comando 5
-mais uma vez — agora a API recusa:
-
-```json
-{"title":"Entity cannot change status","description":"Entity with status success cannot update to success.","translation":"Essa entidade não pode ser atualizada.","code":"QIT001002"}
-```
-
-Isso é uma **regra de negócio**, não um erro de digitação: entidade que
-já terminou não volta atrás. A frase que decide isso mora em
-`src/controllers/sample_entity_controller.py`, e você pode ir ler.
-
-#### 6. Mandar um JSON torto
-
-```bash
-curl -X POST http://localhost:3000/sample_entity \
-  -H "INTERNAL-TOKEN: default_token" \
-  -H "Content-Type: application/json" \
-  -d '{}'
-```
-
-```json
-{"title":"Bad Request","description":"'hello' is a required property","translation":"Payload Inválido","code":"QIT000001"}
-```
-
-**400**, e nada foi criado. O `hello` é obrigatório, e quem recusou não
-foi a regra de negócio: foi o `src/schemas/`, antes da primeira linha da
-rota rodar. Pedido torto não chega a custar uma consulta ao banco.
-
-Repare que ele reclamou de **um** campo, e você deixou cinco de fora. É
-assim mesmo: a validação para no primeiro problema. Tire o `{}` e vá
-preenchendo um campo de cada vez para ver a reclamação andar.
-
-E existe uma fronteira aqui que vale a pena enxergar cedo. Mande um CPF
-com o formato certo e os dígitos errados:
-
-```bash
-curl -X POST http://localhost:3000/sample_entity \
-  -H "INTERNAL-TOKEN: default_token" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "hello": "world",
-    "name": "Maria da Silva",
-    "email": "outra@exemplo.com.br",
-    "document_number": "111.111.111-11",
-    "birthdate": "1990-05-17"
-  }'
-```
-
-```json
-{"title":"Invalid Document Number","description":"The document number 111.111.111-11 is not a valid CPF.","translation":"O CPF informado não é válido.","code":"QIT001003"}
-```
-
-Agora é **422**, não 400. A diferença não é capricho: 400 quer dizer
-"não consegui ler o seu pedido"; 422 quer dizer "li, entendi, e esse
-valor não pode existir". O schema sabe contar pontos e traços — ele não
-sabe fazer a conta dos dois últimos dígitos. Quem sabe é o
-`src/utils/document_number.py`, e por isso essa recusa vem de dentro,
-com código próprio.
-
-#### Esqueceu o `-H "INTERNAL-TOKEN: ..."`?
-
-A API responde **403** e nem chega a olhar o resto:
-
-```json
-{"title":"Forbidden","description":"Request must be internal","translation":"Requisição precisa ser interna","code":"QIT000002"}
-```
-
-#### Toda resposta vem com um número de protocolo
-
-Repare no `-i` deste comando: ele mostra os **cabeçalhos** da resposta,
-não só o corpo.
-
-```bash
-curl -i "http://localhost:3000/sample_entities?limit=1" \
-  -H "INTERNAL-TOKEN: default_token"
-```
-
-```
-HTTP/1.1 200 OK
-content-type: application/json
-x-request-id: 8f3c1e42-1b0d-4f77-9a55-2e4c9d1f0abc
-...
-```
-
-Esse `x-request-id` é o **número de protocolo** da sua requisição: um
-nome único, criado no instante em que ela chegou. Copie o seu e procure
-por ele no log:
-
-```bash
-docker compose logs api | grep 8f3c1e42
-```
-
-```
-[INFO] bootcamp-api.middlewares.request_logger [8f3c1e42-...] - ENTROU GET /sample_entities?limit=1
-[INFO] bootcamp-api.middlewares.request_logger [8f3c1e42-...] - SAIU 200 GET /sample_entities - 2.9 ms
-```
-
-Duas linhas, o mesmo nome nas duas — e nenhuma outra requisição usa esse
-nome. Serve para o dia em que alguém disser "deu erro por volta das
-14h30": sem o número, você abre o log e encontra mil linhas parecidas, de
-mil requisições diferentes, embaralhadas, porque a API atende várias ao
-mesmo tempo e o log é um só. Com o número, achar a agulha é um `grep`.
-
-Se quem chamou já mandar um `x-request-id`, a API **respeita o que veio**
-e usa o mesmo — é assim que se segue um único pedido atravessando vários
-sistemas:
-
-```bash
-curl -i "http://localhost:3000/sample_entities?limit=1" \
-  -H "INTERNAL-TOKEN: default_token" \
-  -H "X-Request-ID: meu-teste-1"
-```
-
-Experimente mandar um valor esquisito nesse cabeçalho — com espaços, ou
-bem comprido. A API não devolve o que você mandou: ela troca por um novo.
-O porquê está em `src/utils/request_context.py`, e é uma das poucas
-lições de segurança que cabem em cinco linhas.
-
-> Só o `/` e o `/health_check` não aparecem no log: o Docker consulta o
-> health check a cada três segundos, e sem essa exceção o log seria
-> quase só isso. Eles ganham o `x-request-id` como todo mundo — o que
-> não ganham é a linha de log.
-
-### Todas as rotas
-
-Sete endereços — este é o mapa inteiro da API:
-
-| Método e rota | O que faz | Responde |
-|---|---|---|
-| `GET /` | diz qual serviço é este | `200` + nome e id |
-| `GET /health_check` | diz se a API está de pé | `204`, sem corpo |
-| `POST /sample_entity` | cria uma entidade | `201` + o `sample_entity_key` |
-| `GET /sample_entity/{key}` | busca uma entidade | `200` + a entidade |
-| `GET /sample_entities` | lista, de dez em dez, com filtros | `200` + a página |
-| `PUT /sample_entity/{key}` | muda o status (`success` ou `failed`) | `202` + o `sample_entity_key` |
-| `PUT /webhook/sample_entity/{key}/increment_counter` | soma 1 no contador | `204`, sem corpo |
-
-As cinco de baixo exigem o `INTERNAL-TOKEN` (seção 6). As duas de cima
-são abertas — a primeira você já usou: foi ela que respondeu no
-navegador.
-
-Os parâmetros da listagem, todos opcionais e combináveis:
-`?limit=` (padrão 10, teto 100) · `?page=` (padrão 0) · `?status=`
-(repetível) · `?name=` · `?email=` · `?document_number=` ·
-`?birthdate_from=` · `?birthdate_to=`. Qualquer outro nome a API
-**recusa** com 400 — é o `src/schemas/get_sample_entities.json` que
-decide, e ele não aceita o que não conhece. Vale a pena errar de
-propósito uma vez:
-
-```bash
-curl "http://localhost:3000/sample_entities?stauts=pending" \
-  -H "INTERNAL-TOKEN: default_token"
-```
-
-Sem essa recusa, um `stauts` com a letra trocada viraria uma lista
-inteira devolvida como se o filtro tivesse funcionado — o pior tipo de
-bug, o que não reclama.
-
-Para desligar tudo: `Ctrl+C` no terminal da API e depois
-
-```bash
-docker compose down
 ```
 
 ---
 
-## 2. Rodando os testes
+### Fluxos
 
-Os testes rodam **na sua máquina**, contra a API que está de pé no
-Docker. Então são dois passos: um de uma vez só, outro toda vez.
+**1. Transação de Transferência**
 
-**Uma vez só — instalar as dependências de teste:**
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Cliente
+    participant API as API (FastAPI)
+    participant Banco as PostgreSQL
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements-dev.txt
-```
+    Cliente->>API: POST /transactions {idempotency_key, origem, destino, amount}
+    API->>Banco: SELECT contas pelas chaves ORDER BY id ASC FOR UPDATE
+    Banco-->>API: contas encontradas e bloqueadas
+    API->>API: Confere saldo da origem >= amount
+    API->>Banco: UPDATE saldo da origem e do destino
+    API->>Banco: INSERT transaction
+    API->>Banco: COMMIT
+    API-->>Cliente: 201 Created {transaction_key}
 
-O `.venv` é uma pasta com um Python só deste projeto. Ele existe pra que
-instalar algo aqui não mexa no Python da sua máquina — e pra que apagar a
-pasta desfaça tudo. No Windows, a segunda linha é
-`.venv\Scripts\activate`.
-
-**Toda vez — com a API de pé, em outro terminal:**
-
-```bash
-pytest
-```
-
-A API precisa estar respondendo antes. Se você acabou de dar
-`docker compose up`, espere o `(healthy)` aparecer — é o healthcheck do
-`docker-compose.yml` dizendo que a porta já atende. Sem isso, o primeiro
-teste bate numa porta que ainda não responde.
-
-O resultado sai assim:
+    Note over API,Banco: Não há pré-consulta da idempotency_key, validação de status ACTIVE nem tarifa neste fluxo.
 
 ```
-tests/integration/test_healthcheck.py::TestHealthCheck::test_home PASSED
-...
-============================== 35 passed in 1.54s ==============================
-```
 
-Para rodar só um arquivo (ou só um teste), acrescente o caminho:
+**2. Retentativa com a mesma chave de idempotência**
 
-```bash
-pytest -v tests/integration/test_healthcheck.py
-```
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Cliente
+    participant API as API (FastAPI)
+    participant Banco as PostgreSQL
 
-Os testes leem o seu `.env` sozinhos (é o `tests/conftest.py` que faz
-isso). Trocou a porta da API ali, os testes passam a bater na porta nova
-— você não configura a mesma coisa em dois lugares.
+    Cliente->>API: Repete POST /transactions com a mesma chave e saldo suficiente
+    API->>Banco: SELECT contas pelas chaves ORDER BY id ASC FOR UPDATE
+    Banco-->>API: Contas bloqueadas
+    API->>API: Confere saldo e prepara atualização dos saldos
+    API->>Banco: INSERT transaction com chave já existente
+    Banco-->>API: UNIQUE violation
+    API-->>Cliente: 409 QIT001412 TransactionConflictError
 
-Os testes de integração exercitam as rotas com o `TestClient` do FastAPI.
-Helpers de teste também usam SQLAlchemy diretamente para preparar saldos
-e conferir dados persistidos. O banco é compartilhado entre execuções e
-não há limpeza automática; os testes criam dados únicos quando necessário.
-
-## 3. Quando dá errado
-
-Os tropeços mais comuns, com a mensagem que você vai ver:
-
-### `port is already allocated`
+    Note over API,Banco: A sessão termina sem COMMIT e desfaz também as atualizações de saldo desta tentativa.
+    Note over API,Banco: Se o saldo já for insuficiente, o controller responde 422 QIT001427 antes de tentar o INSERT.
 
 ```
-Bind for 0.0.0.0:5432 failed: port is already allocated
-```
 
-Outro programa da sua máquina já usa aquela porta (é comum ter um
-Postgres instalado ocupando a 5432). Não precisa descobrir qual: escolha
-outras portas livres. É pra isto que serve o `.env` —
+**3. Duas transferências disputam o mesmo saldo**
 
-```bash
-cp .env.example .env
-```
+```mermaid
+sequenceDiagram
+    autonumber
+    actor ClienteA
+    actor ClienteB
+    participant APIA as API A
+    participant APIB as API B
+    participant Banco as PostgreSQL
 
-— e, dentro dele, tire o `#` da frente destas duas linhas e troque os
-números:
+    Note over Banco: Saldo inicial da origem 100
+    ClienteA->>APIA: Transfere 70 com chave A
+    APIA->>Banco: SELECT origem e destino ORDER BY id ASC FOR UPDATE
+    Banco-->>APIA: Lock concedido e saldo da origem 100
+    ClienteB->>APIB: Transfere 40 com chave B
+    APIB->>Banco: SELECT origem e destino ORDER BY id ASC FOR UPDATE
+    Note right of APIB: A consulta aguarda o lock da origem
+    APIA->>Banco: UPDATE saldos e INSERT transaction
+    APIA->>Banco: COMMIT
+    APIA-->>ClienteA: 201 Created
+    Banco-->>APIB: Lock concedido com saldo atualizado 30
+    APIB->>APIB: 30 < 40
+    APIB-->>ClienteB: 422 QIT001427 InsufficientBalanceError
 
-```
-API_PORT=3001
-DB_PORT=5433
-```
-
-Mexeu no `DB_PORT`? Então mude **também** a porta da `DATABASE_URL`, no
-mesmo arquivo:
-
-```
-DATABASE_URL=postgresql+psycopg2://bootcamp:bootcamp@localhost:5433/bootcamp
-```
-
-São dois lugares porque são dois pontos de vista. O `DB_PORT` diz em
-que porta **da sua máquina** o banco aparece; a `DATABASE_URL` é o
-endereço que os testes usam para chegar nele de fora do Docker. A API
-lá dentro não usa nenhuma das duas — para ela o banco é `db:5432`, e
-por isso essa linha está fixa no `docker-compose.yml`.
-
-Suba de novo. Agora a API atende em http://localhost:3001 — e nos
-comandos `curl` da seção 1 você troca `3000` por `3001`.
-
-### `failed to connect to the docker API`
+    Note over APIB,Banco: B não atualiza saldos nem grava uma transação.
 
 ```
-failed to connect to the docker API at unix:///var/run/docker.sock;
-check if the path is correct and if the daemon is running
-```
 
-O Docker não está ligado. Abra o **Docker Desktop** (Mac/Windows) e
-espere ficar verde. No Linux: `sudo systemctl start docker`.
+**4. Cadastro de Cliente**
 
-### `Não consegui falar com a API` / `Não consegui falar com o banco`
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Cliente
+    participant API as API (FastAPI)
+    participant Banco as PostgreSQL
+    participant Ext as UniversityConnector
 
-Só aparece no atalho local (fora do Docker). Quer dizer que a API ou o
-banco não estão de pé, ou que a porta no seu `.env` não é a que eles
-estão usando. Suba com `docker compose up` e confira as portas.
+    Cliente->>API: POST /customers {document, university_id, course_id}
+    API->>API: JSON Schema: document com 11 dígitos e IDs inteiros >= 1
+    API->>API: Valida os dígitos do CPF
 
-### `relation "..." does not exist`
+    alt CPF matematicamente inválido
+        API-->>Cliente: 422 InvalidDocumentError
+    else CPF válido
+        API->>Ext: GET /universities/{university_id}/students/{document}
+        alt Connector retorna 404
+            Ext-->>API: 404 Not Found
+            API-->>Cliente: 422 InvalidAcademicBondError
+        else Connector retorna 200
+            Ext-->>API: 200 OK
+            API->>Banco: INSERT customer (...)
+            alt Documento já cadastrado
+                Banco-->>API: IntegrityError na constraint UNIQUE(document)
+                API-->>Cliente: 409 DuplicatedCustomerError
+            else Inserção concluída
+                API-->>Cliente: 201 Created {customer_key}
+            end
+        else Outro status externo
+            Ext-->>API: status inesperado
+            API-->>Cliente: 502 UniversityApiError
+        else Timeout
+            Ext-->>API: Timeout
+            API-->>Cliente: 504 UniversityApiTimeoutError
+        end
+    end
 
-```
-psycopg2.errors.UndefinedTable: relation "minha_tabela" does not exist
-```
-
-Você mexeu no `database/database.sql`, e o banco não ficou sabendo.
-Aquele arquivo roda **uma vez só: quando o banco nasce.** Depois disso o
-Postgres nunca mais olha para ele — subir de novo com `docker compose
-up` não adianta, e `docker compose restart db` também não.
-
-Repare no que a mensagem faz com você: ela não diz "seu SQL não rodou",
-diz que a tabela não existe. Você vai reler o seu SQL procurando um erro
-de digitação que não está lá.
-
-Para o banco nascer de novo, já com o schema novo:
-
-```bash
-docker compose down -v
-docker compose up
-```
-
-O `-v` é o que apaga o volume — o disco do banco. **Ele leva junto tudo
-que você tinha criado na mão**, as entidades dos `curl` da seção 1. Não
-tem meio-termo: ou o banco nasce de novo com o schema novo, ou continua
-com o antigo. (Em sistema de verdade é outra história — lá ninguém apaga
-o banco, e a mudança de schema entra por um comando aplicado no deploy.)
-
-### Nada disso resolveu?
-
-Este comando desliga e limpa **este** projeto (containers, rede e o
-banco com tudo dentro) para você recomeçar do zero:
-
-```bash
-docker compose down -v
-docker compose up
-```
-
-Para ver o que a API está dizendo enquanto roda: `docker compose logs -f api`.
-
----
-
-## 4. As pastas
+    Note over API,Banco: A duplicidade é detectada na inserção e não há consulta prévia por CPF
 
 ```
-src/
-  app.py           ← liga tudo: rotas, middlewares e tratamento de erro
-  database.py      ← onde a sessão de banco mora (quem cuida do ciclo
-                     dela é middlewares/session_manager.py)
-  constants.py     ← as configurações, lidas do ambiente
 
-  resources/       ← recebe a requisição HTTP e devolve a resposta
-                     (quem liga cada endereço a um resource é o app.py)
-  schemas/         ← o formato do que entra: o JSON do corpo e os
-                     parâmetros do endereço
-  controllers/     ← as regras de negócio: o que pode e o que não pode
-  repositories/    ← as conversas com o banco
-  models/          ← as tabelas, descritas em Python
-  errors/          ← os erros da API, cada um com seu código
-  middlewares/     ← o que acontece com TODA requisição
-  connectors/      ← as conversas com outros serviços
-  utils/           ← as ferramentas que não são de nenhuma camada
+**5. Divisão de Conta com sucesso**
 
-database/
-  database.sql     ← as tabelas, em SQL puro
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Cliente
+    participant API as API (FastAPI)
+    participant Banco as PostgreSQL
 
-tests/             ← os testes
-```
+    Cliente->>API: POST /transactions/{key}/splits {splits: [{account_key, amount}]}
+    API->>API: Valida estrutura, UUIDs e mínimos do payload
+    API->>Banco: SELECT transaction pela chave
+    Banco-->>API: Transação encontrada
+    API->>API: Confere soma(split.amount) == transaction.amount
+    API->>Banco: SELECT contas pelas chaves account_key dos splits
+    Banco-->>API: Todas as contas pagadoras encontradas
+    API->>Banco: INSERT múltiplos registros em split_bill
+    API->>Banco: COMMIT
+    API-->>Cliente: 201 Created {status}
 
-### Por que tanta pasta?
-
-Porque cada uma tem **um trabalho só**, e só conversa com a vizinha:
+    Note over API,Banco: O controller verifica existência das contas, mas não consulta status ACTIVE/BLOCKED/CLOSED.
 
 ```
-requisição → resource → controller → repository → banco
-                 ↑           ↑
-             valida o     decide o
-              formato     que pode
-```
 
-O resource não sabe SQL. O repository não sabe o que é uma regra de
-negócio. Um teste rápido para saber se uma linha está na pasta certa:
-**nenhum `raise` mora em `resources/`** — quem recusa é o schema, antes,
-ou o controller, depois. Confira você mesmo:
+**6. Divisão de Conta — item inválido ou pagador duplicado**
 
-```bash
-grep -rn "raise" src/resources/
-```
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Cliente
+    participant API as API (FastAPI)
+    participant Banco as PostgreSQL
 
-Não volta nada, e isso é de propósito. Quando você precisa trocar o banco, mexe numa pasta. Quando a
-regra muda, mexe na outra. É isso que permite um time inteiro trabalhar
-no mesmo projeto sem pisar no pé um do outro.
+    Cliente->>API: POST /transactions/{key}/splits com item sem amount
+    API->>API: Schema rejeita campo obrigatório ausente
+    API-->>Cliente: 400 QIT000001 InvalidSchema
 
----
+    Cliente->>API: POST /transactions/{key}/splits com account_key duplicado
+    API->>API: Controller rejeita pagadores repetidos
+    API-->>Cliente: 400 QIT001400 BadRequestError
 
-## 5. Configuração e senhas
-
-Toda configuração entra por **variável de ambiente** — nunca escrita no
-meio do código.
-
-- **valor padrão** → escrito no `docker-compose.yml`, na forma
-  `${VARIAVEL:-padrao}`. É por causa dele que o `docker compose up`
-  funciona sem preparo nenhum.
-- `.env` → **opcional**, fica só na sua máquina e **nunca** vai para o
-  Git. Serve para sobrescrever um padrão (porta ocupada, outro token).
-- `.env.example` → vai para o Git, e é a cópia de onde você parte. Só
-  tem valor de mentirinha.
-
-Essa separação não é frescura. Senha commitada em repositório é uma das
-formas mais comuns de vazamento de dados no mundo real, e não tem
-desfazer: uma vez no histórico, está lá para sempre.
-
-Uma ressalva honesta: valor padrão de senha em arquivo versionado só
-vale porque aqui é um projeto de estudo, sem dado de ninguém. Em
-sistema de verdade, segredo não tem padrão — ele falta, e a aplicação
-se recusa a subir sem ele.
-
-## 6. Autenticação
-
-As rotas de negócio pedem um cabeçalho:
+    Note over API,Banco: Nos dois casos a transação não é consultada e nada é gravado.
 
 ```
-INTERNAL-TOKEN: default_token
+
+**7. Divisão de Conta — transação inexistente**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Cliente
+    participant API as API (FastAPI)
+    participant Banco as PostgreSQL
+
+    Cliente->>API: POST /transactions/{key}/splits com splits válidos
+    API->>Banco: SELECT transaction pela chave
+    Banco-->>API: Nenhuma linha
+    API-->>Cliente: 404 QIT001105 TransactionNotFoundError
+
+    Note over API,Banco: Os valores e as contas pagadoras ainda não são consultados.
+
 ```
 
-Sem ele, a API responde **403**. `default_token` é o valor padrão; para
-trocar, ponha `INTERNAL_TOKEN=outra_coisa` no seu `.env`.
+**8. Divisão de Conta — soma diferente do total**
 
-Ficam abertas, de propósito, só duas: a rota raiz e o `/health_check`
-— esta última porque quem a consulta é o próprio Docker, que não tem
-como mandar cabeçalho.
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Cliente
+    participant API as API (FastAPI)
+    participant Banco as PostgreSQL
 
----
+    Cliente->>API: POST /transactions/{key}/splits
+    API->>Banco: SELECT transaction pela chave
+    Banco-->>API: Transação com amount 100
+    API->>API: Soma de split.amount resulta em 90
+    API-->>Cliente: 422 QIT001428 InvalidSplitAmountError
 
-## 7. Os códigos de erro
+    Note over API,Banco: As contas pagadoras não são consultadas e nenhum split é gravado.
 
-Todo erro da API responde no mesmo formato, com um código próprio:
-
-```json
-{
-  "title": "Bad Request",
-  "description": "'hello' is a required property",
-  "translation": "Payload Inválido",
-  "code": "QIT000001"
-}
 ```
 
-| Código      | Quando acontece                                  |
-|-------------|--------------------------------------------------|
-| `QIT000001` | o JSON enviado está fora do formato              |
-| `QIT000002` | faltou o `INTERNAL-TOKEN`, ou ele está errado    |
-| `QIT000010` | os parâmetros do endereço se contradizem         |
-| `QIT000404` | essa rota não existe                             |
-| `QIT000405` | a rota existe, mas não aceita esse método        |
-| `QIT000500` | erro inesperado (o time é avisado)               |
-| `QIT001001` | a entidade procurada não existe                  |
-| `QIT001002` | a entidade já está num status final              |
-| `QIT001003` | o CPF tem o formato certo, mas não é um CPF      |
-| `QIT001004` | já existe um cadastro com esse CPF               |
-| `QIT001005` | já existe um cadastro com esse e-mail            |
-| `QIT001006` | a pessoa é menor de idade                        |
-| `QIT001007` | a data de nascimento não existe no calendário    |
+**9. Divisão de Conta — pagador inexistente**
 
-Um código estável vale mais que uma mensagem bonita: quem integra com a
-API programa em cima do código, não do texto.
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Cliente
+    participant API as API (FastAPI)
+    participant Banco as PostgreSQL
 
-Os números não são sorteados. Eles vêm em duas faixas:
+    Cliente->>API: POST /transactions/{key}/splits com soma correta
+    API->>Banco: SELECT transaction pela chave
+    Banco-->>API: Transação encontrada
+    API->>API: Soma de split.amount == transaction.amount
+    API->>Banco: SELECT contas pagadoras pelas account_key dos splits
+    Banco-->>API: Uma ou mais contas não encontradas
+    API-->>Cliente: 422 QIT001426 InvalidAccountsError
 
-- **`QIT000…`** — os erros que **toda** API tem: JSON errado, sem token,
-  rota inexistente. Estão em `src/errors/base_error.py` e você não
-  precisa mexer neles.
-- **`QIT001…`** — os erros das **regras deste projeto**. Estão em
-  `src/errors/custom_errors.py`, e é aí que os seus entram: o próximo
-  livre é o `QIT001008`.
+    Note over API,Banco: Nenhum registro de split é gravado.
 
-Não repita um número. Se repetir, a API **não sobe** — tem uma checagem
-no start (`error_verification`, em `src/errors/base_error.py`) que
-procura código repetido e derruba a aplicação de propósito. Parecer
-chato agora é melhor que dois erros diferentes chegarem ao cliente com o
-mesmo código.
+```
 
----
+**10. Abertura de Conta**
 
-## 8. A licença
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Cliente
+    participant API as API (FastAPI)
+    participant Banco as PostgreSQL
 
-Este projeto é **MIT** — pode usar, copiar, modificar e levar para o seu
-portfólio, inclusive em trabalho pago. O único pedido é manter o arquivo
-`LICENSE` junto quando você distribuir o código.
+    Cliente->>API: POST /accounts {customer_key, type_id}
+    API->>Banco: SELECT customer pela customer_key
+    alt Cliente inexistente
+        Banco-->>API: Nenhuma linha
+        API-->>Cliente: 404 CustomerNotFoundError
+    else Cliente encontrado
+        API->>Banco: SELECT account_status WHERE name = 'ACTIVE'
+        alt Status ACTIVE não configurado
+            Banco-->>API: Nenhuma linha
+            API-->>Cliente: 500 StatusNotConfiguredError
+        else Status encontrado
+            API->>Banco: INSERT account com status ACTIVE
+            API->>Banco: INSERT account_status_event (from_status_id NULL)
+            API->>Banco: COMMIT
+            API-->>Cliente: 201 Created {account_key}
+        end
+    end
+
+    Note over API,Banco: A tabela customer não tem status e este fluxo não verifica cliente bloqueado.
+
+```
+
+**11. Autenticação das Rotas**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Cliente
+    participant API as API (FastAPI)
+    participant Auth as Middleware interno
+    participant Rota as Resource
+
+    Cliente->>API: Requisição HTTP
+    API->>Auth: Verifica path, método e INTERNAL-TOKEN
+    alt Path público (/ ou /health_check) ou método OPTIONS
+        Auth->>Rota: Encaminha sem exigir token
+        Rota-->>Cliente: Resposta da rota pública
+    else Token ausente ou inválido
+        Auth-->>Cliente: 403 ForbiddenNotInternal
+    else Token válido
+        Auth->>Rota: Encaminha requisição
+        Rota-->>Cliente: Resposta do endpoint
+    end
+
+```
+
+**12. Resgate de Benefício**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Cliente
+    participant API as API (FastAPI)
+    participant Banco as PostgreSQL
+
+    Cliente->>API: POST /benefits/{key}/redemptions {customer_key}
+    API->>API: Valida payload e UUID de customer_key
+    API->>Banco: SELECT customer pela customer_key
+    alt Cliente inexistente
+        Banco-->>API: Nenhuma linha
+        API-->>Cliente: 404 CustomerNotFoundError
+    else Cliente encontrado
+        API->>Banco: SELECT benefit pela benefit_key
+        alt Benefício inexistente
+            Banco-->>API: Nenhuma linha
+            API-->>Cliente: 404 BenefitNotFoundError
+        else Benefício encontrado
+            alt Universidade alvo incompatível
+                API-->>Cliente: 422 IneligibleUniversityError
+            else Curso alvo incompatível
+                API-->>Cliente: 422 IneligibleCourseError
+            else Cliente elegível
+                API->>Banco: INSERT benefit_redemption
+                alt Cliente já resgatou este benefício
+                    Banco-->>API: IntegrityError na chave única benefício-cliente
+                    API-->>Cliente: 409 BenefitAlreadyRedeemedError
+                else Resgate criado
+                    API->>Banco: COMMIT
+                    API-->>Cliente: 201 Created {voucher_code}
+                end
+            end
+        end
+    end
+
+```
+
+**13. Contratação de Seguro**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Cliente
+    participant API as API (FastAPI)
+    participant Banco as PostgreSQL
+
+    Cliente->>API: POST /insurances {customer_key, insurance_id}
+    API->>API: Valida payload, UUID e insurance_id >= 1
+    API->>Banco: SELECT customer pela customer_key
+    alt Cliente inexistente
+        Banco-->>API: Nenhuma linha
+        API-->>Cliente: 404 CustomerNotFoundError
+    else Cliente encontrado
+        API->>Banco: SELECT insurance pelo insurance_id
+        alt Seguro inexistente
+            Banco-->>API: Nenhuma linha
+            API-->>Cliente: 404 InsuranceNotFoundError
+        else Seguro encontrado
+            API->>Banco: INSERT contracted_insurance
+            alt Cliente já contratou este seguro
+                Banco-->>API: IntegrityError na chave única seguro-cliente
+                API-->>Cliente: 409 InsuranceAlreadyContractedError
+            else Contrato criado
+                API->>Banco: COMMIT
+                API-->>Cliente: 201 Created {policy_number}
+            end
+        end
+    end
+
+```
+
+**14. Consulta de Extrato — paginação por cursor**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Cliente
+    participant API as API (FastAPI)
+    participant Banco as PostgreSQL
+
+    Cliente->>API: GET /accounts/{account_key}/transactions?limit=10&cursor=...
+    API->>API: Valida UUID da conta, limit e cursor
+    API->>Banco: SELECT account pela account_key
+    alt Conta inexistente
+        Banco-->>API: Nenhuma linha
+        API-->>Cliente: 404 QIT001102 AccountNotFoundError
+    else Conta encontrada
+        API->>Banco: SELECT transactions de origem ou destino, id > cursor, ORDER BY id ASC LIMIT limit
+        Banco-->>API: Página de transações
+        API->>API: Formata cada item como DEBIT ou CREDIT
+        API->>API: Define next_cursor pelo ID do último item, ou null se vazio
+        API-->>Cliente: 200 {data, next_cursor}
+    end
+
+    Note over API,Banco: cursor é o ID interno da transação retornado em next_cursor, não o transaction_key.
+
+```
+
+**15. Listagem do Catálogo de Benefícios**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Cliente
+    participant API as API (FastAPI)
+    participant Banco as PostgreSQL
+
+    Cliente->>API: GET /benefits com INTERNAL-TOKEN
+    API->>Banco: SELECT benefit JOIN partner ORDER BY benefit.id
+    Banco-->>API: Benefícios, parceiros e alvos de elegibilidade
+    API-->>Cliente: 200 {data: lista}
+
+    Note over API,Banco: Sem registros, data é uma lista vazia. O endpoint lista o catálogo e não filtra por universidade/curso.
+
+```
