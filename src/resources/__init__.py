@@ -1,0 +1,6 @@
+from resources.health_check import HealthCheckResource
+from resources.account_resource import AccountResource
+from resources.benefit_resource import BenefitResource
+from resources.customer_resource import CustomerResource
+from resources.insurance_resource import InsuranceResource
+from resources.transaction_resource import TransactionResource
